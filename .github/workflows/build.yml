@@ -1,0 +1,98 @@
+name: Build SubSentry APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Lets you upload the three files flat (no folders) from a phone.
+      - name: Arrange files
+        run: |
+          mkdir -p lib
+          if [ -f main.dart ]; then mv main.dart lib/main.dart; fi
+          if [ -f guides.dart ]; then mv guides.dart lib/guides.dart; fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Android project files
+        run: |
+          flutter create --org com.subsentry --project-name subsentry --platforms=android _scaffold
+          cp -r _scaffold/android android
+          rm -rf _scaffold
+
+      - name: Patch Android config (notifications)
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+
+          mp = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+          m = mp.read_text()
+          perms = (
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n'
+              '    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\n'
+          )
+          if 'POST_NOTIFICATIONS' not in m:
+              m = m.replace('<application', perms + '    <application', 1)
+          receivers = (
+              '        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />\n'
+              '        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">\n'
+              '            <intent-filter>\n'
+              '                <action android:name="android.intent.action.BOOT_COMPLETED"/>\n'
+              '                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>\n'
+              '            </intent-filter>\n'
+              '        </receiver>\n'
+          )
+          if 'ScheduledNotificationReceiver' not in m:
+              m = m.replace('</application>', receivers + '    </application>', 1)
+          m = re.sub(r'android:label="[^"]*"', 'android:label="SubSentry"', m, count=1)
+          mp.write_text(m)
+
+          for name in ('build.gradle.kts', 'build.gradle'):
+              p = pathlib.Path('android/app') / name
+              if not p.exists():
+                  continue
+              g = p.read_text()
+              kts = name.endswith('.kts')
+              flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
+              dep = ('coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")' if kts
+                     else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'")
+              if 'compileOptions {' in g:
+                  g = g.replace('compileOptions {', 'compileOptions {\n        ' + flag, 1)
+              else:
+                  g = g.replace('android {', 'android {\n    compileOptions {\n        ' + flag + '\n    }', 1)
+              if 'dependencies {' in g:
+                  g = g.replace('dependencies {', 'dependencies {\n    ' + dep, 1)
+              else:
+                  g += '\ndependencies {\n    ' + dep + '\n}\n'
+              p.write_text(g)
+          PY
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release --target-platform android-arm,android-arm64
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: SubSentry build ${{ github.run_number }}
+          files: build/app/outputs/flutter-apk/app-release.apk
